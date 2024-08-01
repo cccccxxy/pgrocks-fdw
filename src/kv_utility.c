@@ -62,14 +62,21 @@ typedef struct DroppedObject {
 } DroppedObject;
 
 
+// #define PREVIOUS_UTILITY (PreviousProcessUtilityHook != NULL ? \
+//                           PreviousProcessUtilityHook : standard_ProcessUtility)
+
+// #define CALL_PREVIOUS_UTILITY(parseTree, queryString, context, paramListInfo, \
+//                               destReceiver, qc) \
+//         PREVIOUS_UTILITY(plannedStmt, queryString, context, paramListInfo, \
+//                          queryEnvironment, destReceiver, qc)
+// FIXME:
 #define PREVIOUS_UTILITY (PreviousProcessUtilityHook != NULL ? \
                           PreviousProcessUtilityHook : standard_ProcessUtility)
 
-#define CALL_PREVIOUS_UTILITY(parseTree, queryString, context, paramListInfo, \
-                              destReceiver, qc) \
-        PREVIOUS_UTILITY(plannedStmt, queryString, context, paramListInfo, \
-                         queryEnvironment, destReceiver, qc)
-
+#define CALL_PREVIOUS_UTILITY(plannedStmt, queryString, readOnlyTree, context, paramListInfo, \
+                              queryEnv, destReceiver, qc) \
+        PREVIOUS_UTILITY(plannedStmt, queryString, readOnlyTree, context, paramListInfo, \
+                         queryEnv, destReceiver, qc)
 
 /*
  * SQL functions
@@ -81,6 +88,7 @@ static ProcessUtility_hook_type PreviousProcessUtilityHook = NULL;
 
 /* local functions forward declarations */
 static void KVProcessUtility(PlannedStmt* plannedStmt, const char* queryString,
+                             bool readOnlyTree,
                              ProcessUtilityContext context,
                              ParamListInfo paramListInfo,
                              QueryEnvironment* queryEnvironment,
@@ -579,8 +587,14 @@ static uint64 KVCopyIntoTable(const CopyStmt* copyStmt, const char* queryString)
     /* init state to read from COPY data source */
     ParseState* pstate = make_parsestate(NULL);
     pstate->p_sourcetext = queryString;
-    CopyState copyState = BeginCopyFrom(pstate, relation, copyStmt->filename,
-                                        copyStmt->is_program, NULL,
+    /*
+    extern CopyFromState BeginCopyFrom(ParseState *pstate, Relation rel, Node *whereClause,
+								   const char *filename,
+								   bool is_program, copy_data_source_cb data_source_cb, List *attnamelist, List *options);
+
+    */
+    CopyFromState copyState = BeginCopyFrom(pstate, relation, NULL, copyStmt->filename,
+                                        true, NULL,
                                         copyStmt->attlist, copyStmt->options);
     free_parsestate(pstate);
 
@@ -685,7 +699,10 @@ static uint64 KVCopyOutTable(CopyStmt* copyStmt, const char* queryString) {
                                                      relation->relname);
     StringInfo newQuerySubstring = makeStringInfo();
     appendStringInfo(newQuerySubstring, "select * from %s", qualifiedName);
-    List* queryList = raw_parser(newQuerySubstring->data);
+    /*
+    extern List *raw_parser(const char *str, RawParseMode mode);
+    */
+    List* queryList = raw_parser(newQuerySubstring->data, RAW_PARSE_DEFAULT);
 
     /* take the first parse tree */
     Node* rawQuery = linitial(queryList);
@@ -721,7 +738,7 @@ static uint64 KVCopyOutTable(CopyStmt* copyStmt, const char* queryString) {
  * float <--> integer, which does not deserialize successfully in our case.
  */
 static void KVCheckAlterTable(AlterTableStmt* alterStmt) {
-    ObjectType objectType = alterStmt->relkind;
+    ObjectType objectType = alterStmt->objtype;
     /* we are only interested in foreign table changes */
     if (objectType != OBJECT_TABLE && objectType != OBJECT_FOREIGN_TABLE) {
         return;
@@ -777,6 +794,7 @@ static void KVCheckAlterTable(AlterTableStmt* alterStmt) {
  * utility command via macro CALL_PREVIOUS_UTILITY.
  */
 static void KVProcessUtility(PlannedStmt* plannedStmt, const char* queryString,
+                             bool readOnlyTree,
                              ProcessUtilityContext context,
                              ParamListInfo paramListInfo,
                              QueryEnvironment* queryEnvironment,
@@ -801,8 +819,8 @@ static void KVProcessUtility(PlannedStmt* plannedStmt, const char* queryString,
                 qc->nprocessed = rowCount;
             }
         } else {
-            CALL_PREVIOUS_UTILITY(parseTree, queryString, context,
-                                  paramListInfo, destReceiver, qc);
+            CALL_PREVIOUS_UTILITY(plannedStmt, queryString, readOnlyTree, context, paramListInfo, \
+                              queryEnvironment, destReceiver, qc);
         }
     } else if (nodeTag(parseTree) == T_DropStmt) {
 
@@ -821,8 +839,8 @@ static void KVProcessUtility(PlannedStmt* plannedStmt, const char* queryString,
                 }
             }
 
-            CALL_PREVIOUS_UTILITY(parseTree, queryString, context,
-                                  paramListInfo, destReceiver, qc);
+            CALL_PREVIOUS_UTILITY(plannedStmt, queryString, readOnlyTree, context, paramListInfo, \
+                              queryEnvironment, destReceiver, qc);
 
             if (removeDirectory) {
                 KVRemoveDatabaseDirectory(MyDatabaseId);
@@ -833,8 +851,8 @@ static void KVProcessUtility(PlannedStmt* plannedStmt, const char* queryString,
             List* droppedTables = KVDroppedFilenameList((DropStmt*) parseTree);
 
             /* delete metadata */
-            CALL_PREVIOUS_UTILITY(parseTree, queryString, context,
-                                  paramListInfo, destReceiver, qc);
+           CALL_PREVIOUS_UTILITY(plannedStmt, queryString, readOnlyTree, context, paramListInfo, \
+                              queryEnvironment, destReceiver, qc);
 
             /* delete real data and worker */
             ListCell* fileCell = NULL;
@@ -852,8 +870,8 @@ static void KVProcessUtility(PlannedStmt* plannedStmt, const char* queryString,
     } else if (nodeTag(parseTree) == T_AlterTableStmt) {
         AlterTableStmt* alterStmt = (AlterTableStmt*) parseTree;
         KVCheckAlterTable(alterStmt);
-        CALL_PREVIOUS_UTILITY(parseTree, queryString, context, paramListInfo,
-                              destReceiver, qc);
+        CALL_PREVIOUS_UTILITY(plannedStmt, queryString, readOnlyTree, context, paramListInfo, \
+                              queryEnvironment, destReceiver, qc);
     } else if (nodeTag(parseTree) == T_DropdbStmt) {
         DropdbStmt* dropdbStmt = (DropdbStmt*) parseTree;
         Oid dbId = get_database_oid(dropdbStmt->dbname, true);
@@ -869,8 +887,8 @@ static void KVProcessUtility(PlannedStmt* plannedStmt, const char* queryString,
         }
 
         /* delete metadata */
-        CALL_PREVIOUS_UTILITY(parseTree, queryString, context, paramListInfo,
-                              destReceiver, qc);
+        CALL_PREVIOUS_UTILITY(plannedStmt, queryString, readOnlyTree, context, paramListInfo, \
+                              queryEnvironment, destReceiver, qc);
 
         /* delete database from kv_fdw directory */
         if (OidIsValid(dbId)) {
@@ -878,7 +896,7 @@ static void KVProcessUtility(PlannedStmt* plannedStmt, const char* queryString,
         }
     } else {
         /* handle other utility statements */
-        CALL_PREVIOUS_UTILITY(parseTree, queryString, context, paramListInfo,
-                              destReceiver, qc);
+        CALL_PREVIOUS_UTILITY(plannedStmt, queryString, readOnlyTree, context, paramListInfo, \
+                              queryEnvironment, destReceiver, qc);
     }
 }
