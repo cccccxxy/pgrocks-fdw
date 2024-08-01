@@ -34,6 +34,9 @@
 #include "optimizer/optimizer.h"
 #endif
 
+#include <time.h>
+#include <stdio.h>
+
 
 PG_MODULE_MAGIC;
 PG_FUNCTION_INFO_V1(kv_fdw_handler);
@@ -65,12 +68,10 @@ typedef struct TableReadState {
     size_t bufLen; /* shared mem length, no next batch if it is 0 */
     char* next;    /* pointer to the next data entry for IterateForeignScan */
     bool hasNext;  /* whether a next batch from RangeQuery or ReadBatch*/
-
     #ifdef VIDARDB
     bool useColumn;
     List* targetAttrs;    /* attributes in select, where, group */
     #endif
-
     bool execExplainOnly;
 } TableReadState;
 
@@ -90,11 +91,21 @@ typedef struct TableWriteState {
 } TableWriteState;
 
 /*
+ * For a baserel, this struct is created by GetForeignRelSize.
+ */
+typedef struct KVFdwRelationInfo {
+    double rows;
+    time_t last_update_time;
+} KVFdwRelationInfo;
+
+#define CACHE_EXPIRY_TIME 60  // Cache expiry time in seconds
+
+/*
  * in backend process scope
  */
 
 static uint64 operationId = 0;  /* a SQL might cause multiple scans */
-
+static KVFdwRelationInfo fpinfo  = {0, 0};
 
 static void GetForeignRelSize(PlannerInfo* root, RelOptInfo* baserel,
                               Oid foreignTableId) {
@@ -182,10 +193,49 @@ static void GetForeignRelSize(PlannerInfo* root, RelOptInfo* baserel,
     args.attrCount = planState->attrCount;
     #endif
 
+    // KVOpenRequest(foreignTableId, &args);
+    // /* TODO: better estimation */
+    // // baserel->rows = KVCountRequest(foreignTableId);
+    // KVFdwRelationInfo *fpinfo;
+    // fpinfo->rows = KVCountRequest(foreignTableId)
+    // baserel->rows = fpinfo->rows;    
+    // KVCloseRequest(foreignTableId);
+
+    // FIXME
+    // static KVFdwRelationInfo fpinfo = {0, 0};
+    // time_t current_time = time(NULL);
+    // KVOpenRequest(foreignTableId, &args);
+    // // Check if the cache has expired
+    // if (difftime(current_time, fpinfo.last_update_time) > CACHE_EXPIRY_TIME) {
+    //     fpinfo.rows = KVCountRequest(foreignTableId);
+    //     fpinfo.last_update_time = current_time;
+    // }
+    // baserel->rows = fpinfo.rows;
+    // KVCloseRequest(foreignTableId);
+
+
+    clock_t start_time, end_time;
+    double cpu_time_used;
+
+    start_time = clock();
+    
+    time_t current_time = time(NULL);
     KVOpenRequest(foreignTableId, &args);
-    /* TODO: better estimation */
-    baserel->rows = KVCountRequest(foreignTableId);
+    // Check if the cache has expired
+    if (fpinfo.last_update_time == 0 || difftime(current_time, fpinfo.last_update_time) > CACHE_EXPIRY_TIME) {
+        fpinfo.rows = KVCountRequest(foreignTableId);
+        fpinfo.last_update_time = current_time;
+    }
+    baserel->rows = fpinfo.rows;
     KVCloseRequest(foreignTableId);
+    // KVOpenRequest(foreignTableId, &args);
+    // /* TODO: better estimation */
+    // baserel->rows = KVCountRequest(foreignTableId);   
+    // KVCloseRequest(foreignTableId);
+
+    end_time = clock();
+    cpu_time_used = ((double) (end_time - start_time)) / CLOCKS_PER_SEC;
+    elog(LOG, "GetForeignRelSize execution time: %f seconds", cpu_time_used);
 }
 
 static void GetForeignPaths(PlannerInfo* root, RelOptInfo* baserel,
@@ -1002,7 +1052,8 @@ static TupleTableSlot* ExecForeignInsert(EState* executorState,
     args.key = key->data;
     args.val = val->data;
     KVPutRequest(foreignTableId, &args);
-
+    // FIXME:
+    fpinfo.rows ++;
     if (shouldFree) {
         pfree(heapTuple);
     }
@@ -1070,7 +1121,8 @@ static TupleTableSlot* ExecForeignUpdate(EState* executorState,
     args.key = key->data;
     args.val = val->data;
     KVPutRequest(foreignTableId, &args);
-
+    // FIXME:
+    fpinfo.rows ++;
     if (shouldFree) {
         pfree(heapTuple);
     }
@@ -1135,6 +1187,9 @@ static TupleTableSlot* ExecForeignDelete(EState* executorState,
     delArgs.key = key->data;
     delArgs.keyLen = key->len;
     KVDeleteRequest(foreignTableId, &delArgs);
+
+    // FIXME:
+    fpinfo.rows ++;
 
     /* Key not exists */
     if (vLen == 0) {
